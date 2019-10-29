@@ -625,12 +625,14 @@ Default value: \fB4\fR.
 \fBspa_slop_shift\fR (int)
 .ad
 .RS 12n
-Normally, we don't allow the last 3.2% (1/(2^spa_slop_shift)) of space
-in the pool to be consumed.  This ensures that we don't run the pool
-completely out of space, due to unaccounted changes (e.g. to the MOS).
-It also limits the worst-case time to allocate space.  If we have
-less than this amount of free space, most ZPL operations (e.g. write,
-create) will return ENOSPC.
+Normally, we don't allow some of the space in the pool to be consumed. It is
+the last 3.2% (1/(2^spa_slop_shift)) of space for small pools, but the portion
+gets halved as the slop space reaches the 4GB treshold and then at every
+2^spa_slop_shift times the previous theshold.  This ensures that we don't run
+the pool completely out of space, due to unaccounted changes (e.g. to the MOS).
+It also limits the worst-case time to allocate space, but also doesn't make
+excessive amount of space unavailable.  If we have less than this amount of
+free space, most ZPL operations (e.g. write, create) will return ENOSPC.
 .sp
 Default value: \fB5\fR.
 .RE

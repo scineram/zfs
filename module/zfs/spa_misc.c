@@ -345,12 +345,15 @@ char *zfs_deadman_failmode = "wait";
 int spa_asize_inflation = 24;
 
 /*
- * Normally, we don't allow the last 3.2% (1/(2^spa_slop_shift)) of space in
- * the pool to be consumed.  This ensures that we don't run the pool
- * completely out of space, due to unaccounted changes (e.g. to the MOS).
- * It also limits the worst-case time to allocate space.  If we have
- * less than this amount of free space, most ZPL operations (e.g. write,
- * create) will return ENOSPC.
+ * Normally, we don't allow some of the space in the pool to be consumed. It is
+ * the last 3.2% (1/(2^spa_slop_shift)) of space for small pools, but this
+ * portion gets halved as the slop space reaches the 4GB treshold and then at
+ * every 2^spa_slop_shift times the previous theshold.  This ensures that we
+ * don't run the pool completely out of space, due to unaccounted changes
+ * (e.g. to the MOS).  It also limits the worst-case time to allocate space,
+ * but also doesn't make excessive amount of space unavailable.  If we have
+ * less than this amount of free space, most ZPL operations
+ * (e.g. write, create) will return ENOSPC.
  *
  * Certain operations (e.g. file removal, most administrative actions) can
  * use half the slop space.  They will only return ENOSPC if less than half
@@ -1749,17 +1752,22 @@ spa_get_worst_case_asize(spa_t *spa, uint64_t lsize)
 }
 
 /*
- * Return the amount of slop space in bytes.  It is 1/32 of the pool (3.2%),
- * or at least 128MB, unless that would cause it to be more than half the
- * pool size.
- *
- * See the comment above spa_slop_shift for details.
+ * Return the amount of slop space in bytes.  See the comment above
+ * spa_slop_shift for details.
  */
 uint64_t
 spa_get_slop_space(spa_t *spa)
 {
 	uint64_t space = spa_get_dspace(spa);
-	return (MAX(space >> spa_slop_shift, MIN(space >> 1, spa_min_slop)));
+	uint64_t slop = spa_min_slop;
+	int shift = spa_slop_shift;
+
+	while (space > slop << spa_slop_shift) {
+		slop = MIN(space >> shift, slop << spa_slop_shift);
+		shift++;
+	}
+
+	return (MIN(space >> 1, slop));
 }
 
 uint64_t
