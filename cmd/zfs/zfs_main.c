@@ -122,6 +122,7 @@ static int zfs_do_change_key(int argc, char **argv);
 static int zfs_do_project(int argc, char **argv);
 static int zfs_do_version(int argc, char **argv);
 static int zfs_do_redact(int argc, char **argv);
+static int zfs_do_wait(int argc, char **argv);
 
 #ifdef __FreeBSD__
 static int zfs_do_jail(int argc, char **argv);
@@ -183,7 +184,8 @@ typedef enum {
 	HELP_VERSION,
 	HELP_REDACT,
 	HELP_JAIL,
-	HELP_UNJAIL
+	HELP_UNJAIL,
+	HELP_WAIT,
 } zfs_help_t;
 
 typedef struct zfs_command {
@@ -248,6 +250,7 @@ static zfs_command_t command_table[] = {
 	{ "unload-key",	zfs_do_unload_key,	HELP_UNLOAD_KEY		},
 	{ "change-key",	zfs_do_change_key,	HELP_CHANGE_KEY		},
 	{ "redact",	zfs_do_redact,		HELP_REDACT		},
+	{ "wait",	zfs_do_wait,		HELP_WAIT		},
 
 #ifdef __FreeBSD__
 	{ "jail",	zfs_do_jail,		HELP_JAIL		},
@@ -298,10 +301,10 @@ get_usage(zfs_help_t idx)
 	case HELP_PROMOTE:
 		return (gettext("\tpromote <clone-filesystem>\n"));
 	case HELP_RECEIVE:
-		return (gettext("\treceive [-vnsFhu] "
+		return (gettext("\treceive [-vMnsFhu] "
 		    "[-o <property>=<value>] ... [-x <property>] ...\n"
 		    "\t    <filesystem|volume|snapshot>\n"
-		    "\treceive [-vnsFhu] [-o <property>=<value>] ... "
+		    "\treceive [-vMnsFhu] [-o <property>=<value>] ... "
 		    "[-x <property>] ... \n"
 		    "\t    [-d | -e] <filesystem>\n"
 		    "\treceive -A <filesystem|volume>\n"));
@@ -410,6 +413,8 @@ get_usage(zfs_help_t idx)
 		return (gettext("\tjail <jailid|jailname> <filesystem>\n"));
 	case HELP_UNJAIL:
 		return (gettext("\tunjail <jailid|jailname> <filesystem>\n"));
+	case HELP_WAIT:
+		return (gettext("\twait [-t <activity>] <filesystem>\n"));
 	}
 
 	abort();
@@ -4328,6 +4333,16 @@ zfs_do_send(int argc, char **argv)
 		}
 	}
 
+	if (flags.dedup) {
+		(void) fprintf(stderr,
+		    gettext("WARNING: deduplicated send is "
+		    "deprecated, and will be removed in a\n"
+		    "future release. (In the future, the flag will be "
+		    "accepted, but a\n"
+		    "regular, non-deduplicated stream will be "
+		    "generated.)\n\n"));
+	}
+
 	if (flags.parsable && flags.verbosity == 0)
 		flags.verbosity = 1;
 
@@ -4408,24 +4423,6 @@ zfs_do_send(int argc, char **argv)
 	if (!(flags.replicate || flags.doall)) {
 		char frombuf[ZFS_MAX_DATASET_NAME_LEN];
 
-		if (redactbook != NULL) {
-			if (strchr(argv[0], '@') == NULL) {
-				(void) fprintf(stderr, gettext("Error: Cannot "
-				    "do a redacted send to a filesystem.\n"));
-				return (1);
-			}
-			if (strchr(redactbook, '#') != NULL) {
-				(void) fprintf(stderr, gettext("Error: "
-				    "redaction bookmark argument must "
-				    "not contain '#'\n"));
-				return (1);
-			}
-		}
-
-		zhp = zfs_open(g_zfs, argv[0], ZFS_TYPE_DATASET);
-		if (zhp == NULL)
-			return (1);
-
 		if (fromname != NULL && (strchr(fromname, '#') == NULL &&
 		    strchr(fromname, '@') == NULL)) {
 			/*
@@ -4454,6 +4451,10 @@ zfs_do_send(int argc, char **argv)
 			(void) strlcat(frombuf, tmpbuf, sizeof (frombuf));
 			fromname = frombuf;
 		}
+
+		zhp = zfs_open(g_zfs, argv[0], ZFS_TYPE_DATASET);
+		if (zhp == NULL)
+			return (1);
 		err = zfs_send_one(zhp, fromname, STDOUT_FILENO, &flags,
 		    redactbook);
 		zfs_close(zhp);
@@ -4552,7 +4553,7 @@ zfs_do_receive(int argc, char **argv)
 		nomem();
 
 	/* check options */
-	while ((c = getopt(argc, argv, ":o:x:dehnuvFsA")) != -1) {
+	while ((c = getopt(argc, argv, ":o:x:dehMnuvFsA")) != -1) {
 		switch (c) {
 		case 'o':
 			if (!parseprop(props, optarg)) {
@@ -4586,6 +4587,9 @@ zfs_do_receive(int argc, char **argv)
 			break;
 		case 'h':
 			flags.skipholds = B_TRUE;
+			break;
+		case 'M':
+			flags.forceunmount = B_TRUE;
 			break;
 		case 'n':
 			flags.dryrun = B_TRUE;
@@ -6208,7 +6212,7 @@ typedef struct holds_cbdata {
 	size_t		cb_max_taglen;
 } holds_cbdata_t;
 
-#define	STRFTIME_FMT_STR "%a %b %e %k:%M %Y"
+#define	STRFTIME_FMT_STR "%a %b %e %H:%M %Y"
 #define	DATETIME_BUF_LEN (32)
 /*
  *
@@ -8316,6 +8320,90 @@ zfs_do_project(int argc, char **argv)
 	}
 
 	return (ret);
+}
+
+static int
+zfs_do_wait(int argc, char **argv)
+{
+	boolean_t enabled[ZFS_WAIT_NUM_ACTIVITIES];
+	int error, i;
+	char c;
+
+	/* By default, wait for all types of activity. */
+	for (i = 0; i < ZFS_WAIT_NUM_ACTIVITIES; i++)
+		enabled[i] = B_TRUE;
+
+	while ((c = getopt(argc, argv, "t:")) != -1) {
+		switch (c) {
+		case 't':
+		{
+			static char *col_subopts[] = { "deleteq", NULL };
+			char *value;
+
+			/* Reset activities array */
+			bzero(&enabled, sizeof (enabled));
+			while (*optarg != '\0') {
+				int activity = getsubopt(&optarg, col_subopts,
+				    &value);
+
+				if (activity < 0) {
+					(void) fprintf(stderr,
+					    gettext("invalid activity '%s'\n"),
+					    value);
+					usage(B_FALSE);
+				}
+
+				enabled[activity] = B_TRUE;
+			}
+			break;
+		}
+		case '?':
+			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
+			    optopt);
+			usage(B_FALSE);
+		}
+	}
+
+	argv += optind;
+	argc -= optind;
+	if (argc < 1) {
+		(void) fprintf(stderr, gettext("missing 'filesystem' "
+		    "argument\n"));
+		usage(B_FALSE);
+	}
+	if (argc > 1) {
+		(void) fprintf(stderr, gettext("too many arguments\n"));
+		usage(B_FALSE);
+	}
+
+	zfs_handle_t *zhp = zfs_open(g_zfs, argv[0], ZFS_TYPE_FILESYSTEM);
+	if (zhp == NULL)
+		return (1);
+
+	for (;;) {
+		boolean_t missing = B_FALSE;
+		boolean_t any_waited = B_FALSE;
+
+		for (int i = 0; i < ZFS_WAIT_NUM_ACTIVITIES; i++) {
+			boolean_t waited;
+
+			if (!enabled[i])
+				continue;
+
+			error = zfs_wait_status(zhp, i, &missing, &waited);
+			if (error != 0 || missing)
+				break;
+
+			any_waited = (any_waited || waited);
+		}
+
+		if (error != 0 || missing || !any_waited)
+			break;
+	}
+
+	zfs_close(zhp);
+
+	return (error);
 }
 
 /*

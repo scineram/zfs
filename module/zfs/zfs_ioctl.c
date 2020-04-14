@@ -4073,6 +4073,83 @@ zfs_ioc_wait(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
 }
 
 /*
+ * This ioctl waits for activity of a particular type to complete. If there is
+ * no activity of that type in progress, it returns immediately, and the
+ * returned value "waited" is false. If there is activity in progress, and no
+ * tag is passed in, the ioctl blocks until all activity of that type is
+ * complete, and then returns with "waited" set to true.
+ *
+ * If a thread waiting in the ioctl receives a signal, the call will return
+ * immediately, and the return value will be EINTR.
+ *
+ * innvl: {
+ *     "wait_activity" -> int32_t
+ * }
+ *
+ * outnvl: "waited" -> boolean_t
+ */
+static const zfs_ioc_key_t zfs_keys_fs_wait[] = {
+	{ZFS_WAIT_ACTIVITY,	DATA_TYPE_INT32,		0},
+};
+
+static int
+zfs_ioc_wait_fs(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	int32_t activity;
+	boolean_t waited = B_FALSE;
+	int error;
+	dsl_pool_t *dp;
+	dsl_dir_t *dd;
+	dsl_dataset_t *ds;
+
+	if (nvlist_lookup_int32(innvl, ZFS_WAIT_ACTIVITY, &activity) != 0)
+		return (SET_ERROR(EINVAL));
+
+	if (activity >= ZFS_WAIT_NUM_ACTIVITIES || activity < 0)
+		return (SET_ERROR(EINVAL));
+
+	if ((error = dsl_pool_hold(name, FTAG, &dp)) != 0)
+		return (error);
+
+	if ((error = dsl_dataset_hold(dp, name, FTAG, &ds)) != 0) {
+		dsl_pool_rele(dp, FTAG);
+		return (error);
+	}
+
+	dd = ds->ds_dir;
+	mutex_enter(&dd->dd_activity_lock);
+	dd->dd_activity_waiters++;
+
+	/*
+	 * We get a long-hold here so that the dsl_dataset_t and dsl_dir_t
+	 * aren't evicted while we're waiting. Normally this is prevented by
+	 * holding the pool, but we can't do that while we're waiting since
+	 * that would prevent TXGs from syncing out. Some of the functionality
+	 * of long-holds (e.g. preventing deletion) is unnecessary for this
+	 * case, since we would cancel the waiters before proceeding with a
+	 * deletion. An alternative mechanism for keeping the dataset around
+	 * could be developed but this is simpler.
+	 */
+	dsl_dataset_long_hold(ds, FTAG);
+	dsl_pool_rele(dp, FTAG);
+
+	error = dsl_dir_wait(dd, ds, activity, &waited);
+
+	dsl_dataset_long_rele(ds, FTAG);
+	dd->dd_activity_waiters--;
+	if (dd->dd_activity_waiters == 0)
+		cv_signal(&dd->dd_activity_cv);
+	mutex_exit(&dd->dd_activity_lock);
+
+	dsl_dataset_rele(ds, FTAG);
+
+	if (error == 0)
+		fnvlist_add_boolean_value(outnvl, ZFS_WAIT_WAITED, waited);
+
+	return (error);
+}
+
+/*
  * fsname is name of dataset to rollback (to most recent snapshot)
  *
  * innvl may contain name of expected target snapshot
@@ -6915,6 +6992,11 @@ zfs_ioctl_init(void)
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,
 	    zfs_keys_pool_wait, ARRAY_SIZE(zfs_keys_pool_wait));
 
+	zfs_ioctl_register("wait_fs", ZFS_IOC_WAIT_FS,
+	    zfs_ioc_wait_fs, zfs_secpolicy_none, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,
+	    zfs_keys_fs_wait, ARRAY_SIZE(zfs_keys_fs_wait));
+
 	/* IOCTLS that use the legacy function signature */
 
 	zfs_ioctl_register_legacy(ZFS_IOC_POOL_FREEZE, zfs_ioc_pool_freeze,
@@ -7152,6 +7234,41 @@ pool_status_check(const char *name, zfs_ioc_namecheck_t type,
 		spa_close(spa, FTAG);
 	}
 	return (error);
+}
+
+int
+zfsdev_getminor(int fd, minor_t *minorp)
+{
+	zfsdev_state_t *zs, *fpd;
+	zfs_file_t *fp;
+	int rc;
+
+	ASSERT(!MUTEX_HELD(&zfsdev_state_lock));
+
+	if ((rc = zfs_file_get(fd, &fp)))
+		return (rc);
+
+	fpd = zfs_file_private(fp);
+	if (fpd == NULL)
+		return (SET_ERROR(EBADF));
+
+	mutex_enter(&zfsdev_state_lock);
+
+	for (zs = zfsdev_state_list; zs != NULL; zs = zs->zs_next) {
+
+		if (zs->zs_minor == -1)
+			continue;
+
+		if (fpd == zs) {
+			*minorp = fpd->zs_minor;
+			mutex_exit(&zfsdev_state_lock);
+			return (0);
+		}
+	}
+
+	mutex_exit(&zfsdev_state_lock);
+
+	return (SET_ERROR(EBADF));
 }
 
 static void *
